@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QStatusBar,
     QVBoxLayout,
     QWidget,
@@ -29,9 +30,9 @@ THUMB_HEIGHT = THUMB_WIDTH * 9 // 16  # default 16:9; aspect preserved during re
 
 
 def bgr_to_qimage(frame_bgr: np.ndarray) -> QImage:
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    h, w, _ = rgb.shape
-    return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+    # Format_BGR888 lets us skip cv2.cvtColor — Qt reads the BGR buffer directly.
+    h, w, _ = frame_bgr.shape
+    return QImage(frame_bgr.data, w, h, 3 * w, QImage.Format_BGR888).copy()
 
 
 def format_timestamp(seconds: float) -> str:
@@ -115,16 +116,36 @@ class ThumbnailWorker(QThread):
                         self._cond.wait()
                     if self._stop:
                         return
-                    idx = self._queue.pop(0)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                if not ok or frame is None:
+                    batch = sorted(set(self._queue))
+                    self._queue = []
+                if not batch:
                     continue
-                h, w = frame.shape[:2]
-                new_w = self._thumb_w
-                new_h = max(1, int(h * new_w / w))
-                thumb = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                self.thumb_ready.emit(idx, bgr_to_qimage(thumb))
+                # One seek per batch; walk forward with grab() between targets.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, batch[0])
+                pos = batch[0]
+                for target in batch:
+                    # Preempt if stopped or a fresh queue arrived.
+                    with self._cond:
+                        if self._stop:
+                            return
+                        if self._queue:
+                            break
+                    while pos < target:
+                        if not cap.grab():
+                            pos = target  # stream ended / corrupt
+                            break
+                        pos += 1
+                    ok, frame = cap.read()
+                    pos += 1
+                    if not ok or frame is None:
+                        continue
+                    h, w = frame.shape[:2]
+                    new_w = self._thumb_w
+                    new_h = max(1, int(h * new_w / w))
+                    thumb = cv2.resize(
+                        frame, (new_w, new_h), interpolation=cv2.INTER_AREA
+                    )
+                    self.thumb_ready.emit(target, bgr_to_qimage(thumb))
         finally:
             cap.release()
 
@@ -187,7 +208,6 @@ class MainWindow(QMainWindow):
         root.addLayout(top)
 
         self.frame_view = AspectLabel()
-        root.addWidget(self.frame_view, 1)
 
         self.thumb_list = QListWidget()
         self.thumb_list.setViewMode(QListWidget.IconMode)
@@ -198,7 +218,7 @@ class MainWindow(QMainWindow):
         self.thumb_list.setIconSize(QSize(THUMB_WIDTH, THUMB_HEIGHT))
         self.thumb_list.setSpacing(6)
         self.thumb_list.setUniformItemSizes(True)
-        self.thumb_list.setFixedHeight(THUMB_HEIGHT + 70)
+        self.thumb_list.setMinimumHeight(THUMB_HEIGHT + 70)
         # Arrow keys (Left/Right/Up/Down) move the list's current item and
         # currentItemChanged drives the main view update.
         self.thumb_list.setFocusPolicy(Qt.StrongFocus)
@@ -210,7 +230,16 @@ class MainWindow(QMainWindow):
             self._schedule_visible_update
         )
         self.thumb_list.viewport().installEventFilter(self)
-        root.addWidget(self.thumb_list)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.frame_view)
+        splitter.addWidget(self.thumb_list)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
+        splitter.setStretchFactor(0, 1)  # main view absorbs window resizes
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([600, THUMB_HEIGHT + 70])
+        root.addWidget(splitter, 1)
 
         self.setStatusBar(QStatusBar())
         self.setFocusPolicy(Qt.StrongFocus)

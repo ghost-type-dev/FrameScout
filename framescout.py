@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer
-from PySide6.QtGui import QImage, QPixmap, QIcon
+from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -164,13 +164,20 @@ class MainWindow(QMainWindow):
         self.open_btn.clicked.connect(self.open_video)
         top.addWidget(self.open_btn)
 
-        top.addWidget(QLabel("Step:"))
+        top.addWidget(QLabel("Step (every N frames):"))
         self.step_combo = QComboBox()
+        self.step_combo.setEditable(True)
+        # Don't auto-insert typed values as new dropdown entries.
+        self.step_combo.setInsertPolicy(QComboBox.NoInsert)
         for n in (1, 3, 5, 10):
-            label = "every 1 frame" if n == 1 else f"every {n} frames"
-            self.step_combo.addItem(label, n)
-        self.step_combo.setCurrentIndex(3)  # default: every 10 frames
-        self.step_combo.currentIndexChanged.connect(self._on_step_changed)
+            self.step_combo.addItem(str(n), n)
+        self.step_combo.setCurrentIndex(3)  # default: 10
+        self.step_combo.lineEdit().setValidator(QIntValidator(1, 10**9, self))
+        # activated fires on dropdown pick; editingFinished fires on Enter /
+        # focus loss after typing. Both funnel into the same commit path.
+        self.step_combo.activated.connect(lambda _: self._commit_step())
+        self.step_combo.lineEdit().editingFinished.connect(self._commit_step)
+        self.step_combo.setFixedWidth(80)
         top.addWidget(self.step_combo)
 
         top.addStretch(1)
@@ -293,8 +300,22 @@ class MainWindow(QMainWindow):
 
     # -------- thumbnails --------
 
-    def _on_step_changed(self) -> None:
-        self.step = self.step_combo.currentData()
+    def _commit_step(self) -> None:
+        text = self.step_combo.currentText().strip()
+        try:
+            n = int(text)
+        except ValueError:
+            n = self.step
+        if n < 1:
+            n = self.step
+        # Reflect the accepted value in the editor (in case we rejected input).
+        if text != str(n):
+            self.step_combo.blockSignals(True)
+            self.step_combo.setCurrentText(str(n))
+            self.step_combo.blockSignals(False)
+        if n == self.step:
+            return
+        self.step = n
         if self.cap is not None:
             self._regen_thumbnails()
         self.thumb_list.setFocus()

@@ -171,6 +171,17 @@ class MainWindow(QMainWindow):
         self._visible_timer.setInterval(30)
         self._visible_timer.timeout.connect(self._update_visible_thumbs)
 
+        # Coalesce rapid navigation (held arrow keys) so the main view only
+        # decodes the latest target instead of backing up a queue of decodes.
+        self._pending_frame: int | None = None
+        self._frame_timer = QTimer(self)
+        self._frame_timer.setSingleShot(True)
+        self._frame_timer.setInterval(0)
+        self._frame_timer.timeout.connect(self._render_pending_frame)
+        # Tracks where the capture will read next; lets us grab() forward for
+        # small jumps instead of doing an expensive keyframe-aligned seek.
+        self._cap_pos: int = 0
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -272,6 +283,9 @@ class MainWindow(QMainWindow):
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         self.current_frame = 0
+        self._cap_pos = 0
+        self._pending_frame = None
+        self._frame_timer.stop()
 
         self.setWindowTitle(f"FrameScout — {Path(path).name}")
         if self.total_frames <= 0:
@@ -287,17 +301,49 @@ class MainWindow(QMainWindow):
 
     # -------- frame display --------
 
+    # Max forward-walk in frames. Past this, doing a fresh seek (which lands
+    # on the nearest prior keyframe and decodes forward) is usually cheaper
+    # than grabbing one-by-one from the current position.
+    _MAX_FORWARD_GRAB = 60
+
     def _read_frame(self, index: int) -> np.ndarray | None:
         if self.cap is None:
             return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        forward = index - self._cap_pos
+        if 0 <= forward <= self._MAX_FORWARD_GRAB:
+            # Walk forward from current position: cheaper than re-seeking
+            # to a prior keyframe and decoding back up to `index`.
+            for _ in range(forward):
+                if not self.cap.grab():
+                    self._cap_pos = index
+                    return None
+        else:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, frame = self.cap.read()
+        self._cap_pos = index + 1 if ok else index
         return frame if ok else None
 
     def _show_frame(self, index: int) -> None:
+        """Request a frame be displayed; coalesced so rapid calls don't back up.
+
+        When arrow keys repeat, we may get events faster than we can decode.
+        Instead of queuing a decode per event, we just record the most recent
+        target and let a 0 ms timer render it on the next event-loop tick.
+        Any further calls that arrive before the timer fires just overwrite
+        the target — intermediate frames are skipped.
+        """
         if self.cap is None or self.total_frames <= 0:
             return
         index = max(0, min(index, self.total_frames - 1))
+        self._pending_frame = index
+        if not self._frame_timer.isActive():
+            self._frame_timer.start()
+
+    def _render_pending_frame(self) -> None:
+        if self.cap is None or self._pending_frame is None:
+            return
+        index = self._pending_frame
+        self._pending_frame = None
         frame = self._read_frame(index)
         if frame is None:
             return
@@ -305,6 +351,9 @@ class MainWindow(QMainWindow):
         self.current_frame = index
         self._update_info()
         self._sync_thumb_selection()
+        # If more navigation piled up during this decode, render again.
+        if self._pending_frame is not None and self._pending_frame != index:
+            self._frame_timer.start()
 
     def _sync_thumb_selection(self) -> None:
         """Highlight the thumbnail whose sampled frame is nearest (≤) current."""

@@ -6,12 +6,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer
-from PySide6.QtGui import QImage, QPixmap, QIcon, QKeySequence, QShortcut
+from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -161,6 +162,8 @@ class MainWindow(QMainWindow):
         self.fps: float = 0.0
         self.current_frame: int = 0
         self.step: int = 32
+        self.range_start: int = 0
+        self.range_end: int = 0  # inclusive; equals total_frames-1 when full
         self.worker: ThumbnailWorker | None = None
         self._item_by_index: dict[int, QListWidgetItem] = {}
         self._thumb_indices: list[int] = []
@@ -212,6 +215,25 @@ class MainWindow(QMainWindow):
         self.step_plus_btn.setAutoRepeat(False)
         self.step_plus_btn.clicked.connect(lambda: self._nudge_step(+1))
         top.addWidget(self.step_plus_btn)
+
+        top.addSpacing(16)
+        top.addWidget(QLabel("Range:"))
+        self.range_start_edit = QLineEdit()
+        self.range_start_edit.setFixedWidth(80)
+        self.range_start_edit.setValidator(QIntValidator(0, 10**9, self))
+        self.range_start_edit.setPlaceholderText("start")
+        self.range_start_edit.editingFinished.connect(self._commit_range)
+        top.addWidget(self.range_start_edit)
+        top.addWidget(QLabel("–"))
+        self.range_end_edit = QLineEdit()
+        self.range_end_edit.setFixedWidth(80)
+        self.range_end_edit.setValidator(QIntValidator(0, 10**9, self))
+        self.range_end_edit.setPlaceholderText("end")
+        self.range_end_edit.editingFinished.connect(self._commit_range)
+        top.addWidget(self.range_end_edit)
+        self.range_reset_btn = QPushButton("Reset")
+        self.range_reset_btn.clicked.connect(self._reset_range)
+        top.addWidget(self.range_reset_btn)
 
         top.addStretch(1)
 
@@ -291,6 +313,10 @@ class MainWindow(QMainWindow):
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
         self.current_frame = 0
+        self.range_start = 0
+        self.range_end = max(self.total_frames - 1, 0)
+        self.range_start_edit.setText(str(self.range_start))
+        self.range_end_edit.setText(str(self.range_end))
         self._cap_pos = 0
         self._pending_frame = None
         self._frame_timer.stop()
@@ -342,7 +368,7 @@ class MainWindow(QMainWindow):
         """
         if self.cap is None or self.total_frames <= 0:
             return
-        index = max(0, min(index, self.total_frames - 1))
+        index = max(self.range_start, min(index, self.range_end))
         self._pending_frame = index
         if not self._frame_timer.isActive():
             self._frame_timer.start()
@@ -386,6 +412,46 @@ class MainWindow(QMainWindow):
 
     # -------- thumbnails --------
 
+    def _commit_range(self) -> None:
+        if self.cap is None or self.total_frames <= 0:
+            return
+        last = self.total_frames - 1
+        try:
+            s = int(self.range_start_edit.text())
+            e = int(self.range_end_edit.text())
+        except ValueError:
+            self.range_start_edit.setText(str(self.range_start))
+            self.range_end_edit.setText(str(self.range_end))
+            return
+        s = max(0, min(s, last))
+        e = max(0, min(e, last))
+        if s > e:
+            s, e = e, s
+        self.range_start_edit.setText(str(s))
+        self.range_end_edit.setText(str(e))
+        if s == self.range_start and e == self.range_end:
+            return
+        self.range_start = s
+        self.range_end = e
+        if self.current_frame < s or self.current_frame > e:
+            self._show_frame(s)
+        self._regen_thumbnails()
+        self.thumb_list.setFocus()
+
+    def _reset_range(self) -> None:
+        if self.cap is None or self.total_frames <= 0:
+            return
+        last = self.total_frames - 1
+        if self.range_start == 0 and self.range_end == last:
+            self.thumb_list.setFocus()
+            return
+        self.range_start = 0
+        self.range_end = last
+        self.range_start_edit.setText(str(self.range_start))
+        self.range_end_edit.setText(str(self.range_end))
+        self._regen_thumbnails()
+        self.thumb_list.setFocus()
+
     def _nudge_step(self, delta: int) -> None:
         # "-" halves the step, "+" doubles it. Floor at 1.
         if delta < 0:
@@ -408,7 +474,7 @@ class MainWindow(QMainWindow):
         if self.cap is None or self.total_frames <= 0 or not self.video_path:
             return
 
-        indices = list(range(0, self.total_frames, self.step))
+        indices = list(range(self.range_start, self.range_end + 1, self.step))
         self._thumb_indices = indices
         # Taller caption area for the second line (timestamp).
         item_size = QSize(THUMB_WIDTH + 16, THUMB_HEIGHT + 52)

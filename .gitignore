@@ -8,3 +8,5 @@ __pycache__/
 
 .codex
 .claude/settings.local.json
+
+tmp/

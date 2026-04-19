@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer
-from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator
+from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -234,6 +234,14 @@ class MainWindow(QMainWindow):
         # currentItemChanged drives the main view update.
         self.thumb_list.setFocusPolicy(Qt.StrongFocus)
         self.thumb_list.currentItemChanged.connect(self._on_current_thumb_changed)
+
+        # "=" zooms in (finer step), "-" zooms out (coarser step). Scoped to
+        # the thumb list so typing "-" into the step combo still works.
+        for seq, delta in (("=", -1), ("-", +1)):
+            sc = QShortcut(QKeySequence(seq), self.thumb_list)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.setAutoRepeat(False)
+            sc.activated.connect(lambda d=delta: self._nudge_step(d))
         self.thumb_list.verticalScrollBar().valueChanged.connect(
             self._schedule_visible_update
         )
@@ -398,6 +406,26 @@ class MainWindow(QMainWindow):
             self._regen_thumbnails()
         self.thumb_list.setFocus()
 
+    def _nudge_step(self, delta: int) -> None:
+        # Snap to powers of two (1, 2, 4, 8, 16, ...). If the current value
+        # isn't a power of two (user typed e.g. 5), round to the nearest
+        # pow2 in the chosen direction so the first press always moves.
+        s = self.step
+        is_pow2 = s & (s - 1) == 0
+        if delta < 0:  # zoom in — smaller
+            n = max(1, s >> 1) if is_pow2 else 1 << (s.bit_length() - 1)
+        else:  # zoom out — larger
+            n = s << 1 if is_pow2 else 1 << s.bit_length()
+        if n == self.step:
+            return
+        self.step_combo.blockSignals(True)
+        self.step_combo.setCurrentText(str(n))
+        self.step_combo.blockSignals(False)
+        self.step = n
+        if self.cap is not None:
+            self._regen_thumbnails()
+        self.thumb_list.setFocus()
+
     def _regen_thumbnails(self) -> None:
         self._stop_worker()
         self.thumb_list.clear()
@@ -408,9 +436,12 @@ class MainWindow(QMainWindow):
 
         indices = list(range(0, self.total_frames, self.step))
         self._thumb_indices = indices
-        item_size = QSize(THUMB_WIDTH + 16, THUMB_HEIGHT + 36)
+        # Taller caption area for the second line (timestamp).
+        item_size = QSize(THUMB_WIDTH + 16, THUMB_HEIGHT + 52)
         for idx in indices:
-            item = QListWidgetItem(str(idx))
+            ts = format_timestamp(idx / self.fps) if self.fps > 0 else ""
+            label = f"{idx}\n{ts}" if ts else str(idx)
+            item = QListWidgetItem(label)
             item.setData(Qt.UserRole, idx)
             item.setSizeHint(item_size)
             item.setTextAlignment(Qt.AlignCenter)

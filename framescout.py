@@ -6,17 +6,23 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer, QItemSelectionModel
 from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -163,6 +169,87 @@ class ThumbnailWorker(QThread):
             cap.release()
 
 
+class ExportWorker(QThread):
+    """Writes a fixed list of frames to disk at full resolution.
+
+    One-shot: the index list is set at construction and walked in order.
+    Uses the same grab-vs-seek heuristic as ThumbnailWorker so big jumps
+    re-seek instead of decoding every intermediate frame.
+    """
+
+    frame_done = Signal(int)  # frame index just written
+    finished_with = Signal(int, int)  # (succeeded, failed)
+
+    def __init__(
+        self,
+        path: str,
+        indices: list[int],
+        dest_dir: str,
+        ext: str,
+        basename: str,
+        max_forward_grab: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._path = path
+        self._indices = sorted(set(indices))
+        self._dest_dir = dest_dir
+        self._ext = ext
+        self._basename = basename
+        self._max_forward_grab = max_forward_grab
+        self._stop_lock = threading.Lock()
+        self._stop = False
+
+    def stop(self) -> None:
+        with self._stop_lock:
+            self._stop = True
+
+    def _stopped(self) -> bool:
+        with self._stop_lock:
+            return self._stop
+
+    def run(self) -> None:
+        cap = cv2.VideoCapture(self._path)
+        if not cap.isOpened() or not self._indices:
+            self.finished_with.emit(0, len(self._indices))
+            return
+        succeeded = 0
+        failed = 0
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, self._indices[0])
+            pos = self._indices[0]
+            for target in self._indices:
+                if self._stopped():
+                    break
+                forward = target - pos
+                if forward < 0 or forward > self._max_forward_grab:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                    pos = target
+                else:
+                    while pos < target:
+                        if not cap.grab():
+                            pos = target
+                            break
+                        pos += 1
+                ok, frame = cap.read()
+                pos += 1
+                if not ok or frame is None:
+                    failed += 1
+                    continue
+                out_path = str(
+                    Path(self._dest_dir)
+                    / f"{self._basename}_frame_{target:06d}.{self._ext}"
+                )
+                if cv2.imwrite(out_path, frame):
+                    succeeded += 1
+                    self.frame_done.emit(target)
+                else:
+                    failed += 1
+        finally:
+            cap.release()
+        self.finished_with.emit(succeeded, failed)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -179,6 +266,7 @@ class MainWindow(QMainWindow):
         self.range_end: int = 0  # inclusive; equals total_frames-1 when full
         self.max_forward_grab: int = 60  # benchmarked at video load
         self.worker: ThumbnailWorker | None = None
+        self.export_worker: ExportWorker | None = None
         self._item_by_index: dict[int, QListWidgetItem] = {}
         self._thumb_indices: list[int] = []
 
@@ -249,6 +337,14 @@ class MainWindow(QMainWindow):
         self.range_reset_btn.clicked.connect(self._reset_range)
         top.addWidget(self.range_reset_btn)
 
+        top.addSpacing(16)
+        self.export_btn = QPushButton("Export Selected")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_selected)
+        top.addWidget(self.export_btn)
+        self.selection_label = QLabel("0 selected")
+        top.addWidget(self.selection_label)
+
         top.addStretch(1)
 
         self.info_label = QLabel("No video loaded")
@@ -270,7 +366,10 @@ class MainWindow(QMainWindow):
         # Arrow keys (Left/Right/Up/Down) move the list's current item and
         # currentItemChanged drives the main view update.
         self.thumb_list.setFocusPolicy(Qt.StrongFocus)
+        self.thumb_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.thumb_list.setSelectionRectVisible(True)
         self.thumb_list.currentItemChanged.connect(self._on_current_thumb_changed)
+        self.thumb_list.itemSelectionChanged.connect(self._on_selection_changed)
 
         # "-" halves the step, "=" doubles it (matches the on-screen buttons).
         for seq, delta in (("-", -1), ("=", +1)):
@@ -457,7 +556,9 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         if self.thumb_list.currentItem() is not item:
-            self.thumb_list.setCurrentItem(item)
+            # NoUpdate: move the "current" cursor (so arrow nav resumes from
+            # here) without disturbing the user's multi-selection.
+            self.thumb_list.setCurrentItem(item, QItemSelectionModel.NoUpdate)
         self.thumb_list.scrollToItem(item, QListWidget.EnsureVisible)
 
     def _update_info(self) -> None:
@@ -610,16 +711,115 @@ class MainWindow(QMainWindow):
             return
         self._show_frame(idx)
 
+    def _on_selection_changed(self) -> None:
+        n = len(self.thumb_list.selectedItems())
+        self.selection_label.setText(f"{n} selected")
+        self.export_btn.setEnabled(n > 0 and self.video_path is not None)
+
+    # -------- export --------
+
+    def _export_selected(self) -> None:
+        if self.video_path is None or self.cap is None:
+            return
+        items = self.thumb_list.selectedItems()
+        indices = sorted(int(it.data(Qt.UserRole)) for it in items)
+        if not indices:
+            return
+
+        dest = QFileDialog.getExistingDirectory(self, "Export frames to folder")
+        if not dest:
+            return
+        ext = self._ask_export_format()
+        if ext is None:
+            return
+
+        basename = Path(self.video_path).stem
+        # Already-running export shouldn't pile up — let user finish/cancel first.
+        if self.export_worker is not None and self.export_worker.isRunning():
+            self.statusBar().showMessage("Another export is already in progress", 4000)
+            return
+
+        worker = ExportWorker(
+            self.video_path,
+            indices,
+            dest,
+            ext,
+            basename,
+            self.max_forward_grab,
+            self,
+        )
+        self.export_worker = worker
+
+        progress = QProgressDialog(
+            f"Exporting {len(indices)} frames…", "Cancel", 0, len(indices), self
+        )
+        progress.setWindowTitle("Export")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        done = {"n": 0}
+
+        def on_frame_done(_idx: int) -> None:
+            done["n"] += 1
+            progress.setValue(done["n"])
+
+        def on_finished(succeeded: int, failed: int) -> None:
+            progress.setValue(len(indices))
+            progress.close()
+            if failed:
+                msg = f"Exported {succeeded} frames to {dest} ({failed} failed)"
+            elif succeeded == 0:
+                msg = "Export cancelled"
+            else:
+                msg = f"Exported {succeeded} frames to {dest}"
+            self.statusBar().showMessage(msg, 6000)
+            self.export_worker = None
+
+        worker.frame_done.connect(on_frame_done)
+        worker.finished_with.connect(on_finished)
+        progress.canceled.connect(worker.stop)
+        worker.start()
+
+    def _ask_export_format(self) -> str | None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Export format")
+        dlg.setMinimumWidth(420)
+        form = QFormLayout(dlg)
+        form.setContentsMargins(16, 16, 16, 12)
+        form.setSpacing(12)
+        combo = QComboBox(dlg)
+        combo.addItems(["png", "jpg"])
+        combo.setCurrentIndex(0)
+        combo.setMinimumWidth(160)
+        form.addRow("Format:", combo)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return combo.currentText()
+
     def _stop_worker(self) -> None:
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait()
             self.worker = None
 
+    def _stop_export_worker(self) -> None:
+        if self.export_worker is not None:
+            self.export_worker.stop()
+            self.export_worker.wait()
+            self.export_worker = None
+
     # -------- cleanup --------
 
     def closeEvent(self, event) -> None:
         self._stop_worker()
+        self._stop_export_worker()
         if self.cap is not None:
             self.cap.release()
         super().closeEvent(event)

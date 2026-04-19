@@ -6,10 +6,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QEvent, QTimer
-from PySide6.QtGui import QImage, QPixmap, QIcon, QIntValidator, QKeySequence, QShortcut
+from PySide6.QtGui import QImage, QPixmap, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -161,7 +160,7 @@ class MainWindow(QMainWindow):
         self.total_frames: int = 0
         self.fps: float = 0.0
         self.current_frame: int = 0
-        self.step: int = 10
+        self.step: int = 32
         self.worker: ThumbnailWorker | None = None
         self._item_by_index: dict[int, QListWidgetItem] = {}
         self._thumb_indices: list[int] = []
@@ -197,20 +196,22 @@ class MainWindow(QMainWindow):
         top.addWidget(self.open_btn)
 
         top.addWidget(QLabel("Step (every N frames):"))
-        self.step_combo = QComboBox()
-        self.step_combo.setEditable(True)
-        # Don't auto-insert typed values as new dropdown entries.
-        self.step_combo.setInsertPolicy(QComboBox.NoInsert)
-        for n in (1, 3, 5, 10):
-            self.step_combo.addItem(str(n), n)
-        self.step_combo.setCurrentIndex(3)  # default: 10
-        self.step_combo.lineEdit().setValidator(QIntValidator(1, 10**9, self))
-        # activated fires on dropdown pick; editingFinished fires on Enter /
-        # focus loss after typing. Both funnel into the same commit path.
-        self.step_combo.activated.connect(lambda _: self._commit_step())
-        self.step_combo.lineEdit().editingFinished.connect(self._commit_step)
-        self.step_combo.setFixedWidth(80)
-        top.addWidget(self.step_combo)
+        self.step_minus_btn = QPushButton("−")
+        self.step_minus_btn.setFixedWidth(32)
+        self.step_minus_btn.setAutoRepeat(False)
+        self.step_minus_btn.clicked.connect(lambda: self._nudge_step(-1))
+        top.addWidget(self.step_minus_btn)
+
+        self.step_label = QLabel(str(self.step))
+        self.step_label.setAlignment(Qt.AlignCenter)
+        self.step_label.setMinimumWidth(48)
+        top.addWidget(self.step_label)
+
+        self.step_plus_btn = QPushButton("+")
+        self.step_plus_btn.setFixedWidth(32)
+        self.step_plus_btn.setAutoRepeat(False)
+        self.step_plus_btn.clicked.connect(lambda: self._nudge_step(+1))
+        top.addWidget(self.step_plus_btn)
 
         top.addStretch(1)
 
@@ -235,9 +236,8 @@ class MainWindow(QMainWindow):
         self.thumb_list.setFocusPolicy(Qt.StrongFocus)
         self.thumb_list.currentItemChanged.connect(self._on_current_thumb_changed)
 
-        # "=" zooms in (finer step), "-" zooms out (coarser step). Scoped to
-        # the thumb list so typing "-" into the step combo still works.
-        for seq, delta in (("=", -1), ("-", +1)):
+        # "-" halves the step, "=" doubles it (matches the on-screen buttons).
+        for seq, delta in (("-", -1), ("=", +1)):
             sc = QShortcut(QKeySequence(seq), self.thumb_list)
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.setAutoRepeat(False)
@@ -386,42 +386,16 @@ class MainWindow(QMainWindow):
 
     # -------- thumbnails --------
 
-    def _commit_step(self) -> None:
-        text = self.step_combo.currentText().strip()
-        try:
-            n = int(text)
-        except ValueError:
-            n = self.step
-        if n < 1:
-            n = self.step
-        # Reflect the accepted value in the editor (in case we rejected input).
-        if text != str(n):
-            self.step_combo.blockSignals(True)
-            self.step_combo.setCurrentText(str(n))
-            self.step_combo.blockSignals(False)
-        if n == self.step:
-            return
-        self.step = n
-        if self.cap is not None:
-            self._regen_thumbnails()
-        self.thumb_list.setFocus()
-
     def _nudge_step(self, delta: int) -> None:
-        # Snap to powers of two (1, 2, 4, 8, 16, ...). If the current value
-        # isn't a power of two (user typed e.g. 5), round to the nearest
-        # pow2 in the chosen direction so the first press always moves.
-        s = self.step
-        is_pow2 = s & (s - 1) == 0
-        if delta < 0:  # zoom in — smaller
-            n = max(1, s >> 1) if is_pow2 else 1 << (s.bit_length() - 1)
-        else:  # zoom out — larger
-            n = s << 1 if is_pow2 else 1 << s.bit_length()
+        # "-" halves the step, "+" doubles it. Floor at 1.
+        if delta < 0:
+            n = max(1, self.step // 2)
+        else:
+            n = self.step * 2
         if n == self.step:
             return
-        self.step_combo.blockSignals(True)
-        self.step_combo.setCurrentText(str(n))
-        self.step_combo.blockSignals(False)
         self.step = n
+        self.step_label.setText(str(n))
         if self.cap is not None:
             self._regen_thumbnails()
         self.thumb_list.setFocus()

@@ -1,6 +1,7 @@
 import bisect
 import sys
 import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -87,10 +88,15 @@ class ThumbnailWorker(QThread):
 
     thumb_ready = Signal(int, QImage)
 
-    def __init__(self, path: str, thumb_w: int, parent=None):
+    def __init__(
+        self, path: str, thumb_w: int, max_forward_grab: int, parent=None
+    ):
         super().__init__(parent)
         self._path = path
         self._thumb_w = thumb_w
+        # Past this many frames forward, seeking to the nearest keyframe is
+        # cheaper than walking via grab(). Set per-video by the caller.
+        self._max_forward_grab = max_forward_grab
         self._cond = threading.Condition()
         self._queue: list[int] = []
         self._stop = False
@@ -120,7 +126,9 @@ class ThumbnailWorker(QThread):
                     self._queue = []
                 if not batch:
                     continue
-                # One seek per batch; walk forward with grab() between targets.
+                # Decode each target. For small gaps we walk forward with
+                # grab(); for big gaps we re-seek so OpenCV jumps to the
+                # nearest prior keyframe instead of decoding everything.
                 cap.set(cv2.CAP_PROP_POS_FRAMES, batch[0])
                 pos = batch[0]
                 for target in batch:
@@ -130,11 +138,16 @@ class ThumbnailWorker(QThread):
                             return
                         if self._queue:
                             break
-                    while pos < target:
-                        if not cap.grab():
-                            pos = target  # stream ended / corrupt
-                            break
-                        pos += 1
+                    forward = target - pos
+                    if forward < 0 or forward > self._max_forward_grab:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+                        pos = target
+                    else:
+                        while pos < target:
+                            if not cap.grab():
+                                pos = target  # stream ended / corrupt
+                                break
+                            pos += 1
                     ok, frame = cap.read()
                     pos += 1
                     if not ok or frame is None:
@@ -164,6 +177,7 @@ class MainWindow(QMainWindow):
         self.step: int = 32
         self.range_start: int = 0
         self.range_end: int = 0  # inclusive; equals total_frames-1 when full
+        self.max_forward_grab: int = 60  # benchmarked at video load
         self.worker: ThumbnailWorker | None = None
         self._item_by_index: dict[int, QListWidgetItem] = {}
         self._thumb_indices: list[int] = []
@@ -329,22 +343,64 @@ class MainWindow(QMainWindow):
             self.thumb_list.clear()
             return
 
+        self.max_forward_grab = self._benchmark_seek_threshold()
+        # Benchmark moved the cap; reset to a known position before display.
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._cap_pos = 0
+        self.statusBar().showMessage(
+            f"Seek/grab threshold: {self.max_forward_grab} frames", 3000
+        )
+
         self._show_frame(0)
         self._regen_thumbnails()
         self.thumb_list.setFocus()
 
-    # -------- frame display --------
+    def _benchmark_seek_threshold(self) -> int:
+        """Estimate forward-grab vs seek breakeven for this video.
 
-    # Max forward-walk in frames. Past this, doing a fresh seek (which lands
-    # on the nearest prior keyframe and decodes forward) is usually cheaper
-    # than grabbing one-by-one from the current position.
-    _MAX_FORWARD_GRAB = 60
+        Times a burst of grab() calls (decode-only) and a handful of seeks
+        to spread-out positions (seek + decode-from-keyframe). The ratio is
+        roughly the GOP-driven breakeven: short-GOP videos get a small
+        threshold, long-GOP / I-frame-only videos get a large one. Clamped
+        to a sane band so weird timings can't break navigation.
+        """
+        if self.cap is None or self.total_frames < 100:
+            return 60
+        cap = self.cap
+        n = self.total_frames
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, n // 4)
+        cap.read()  # prime decoder so the first grab isn't artificially slow
+        grab_n = 30
+        t0 = time.perf_counter()
+        grabbed = 0
+        for _ in range(grab_n):
+            if not cap.grab():
+                break
+            grabbed += 1
+        grab_avg = (time.perf_counter() - t0) / max(grabbed, 1)
+
+        targets = [n // 6, n // 3, n // 2, (2 * n) // 3, (5 * n) // 6]
+        seeked = 0
+        t0 = time.perf_counter()
+        for tgt in targets:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, tgt)
+            ok, _ = cap.read()
+            if ok:
+                seeked += 1
+        if seeked == 0 or grab_avg <= 0:
+            return 60
+        seek_avg = (time.perf_counter() - t0) / seeked
+
+        return max(10, min(600, int(round(seek_avg / grab_avg))))
+
+    # -------- frame display --------
 
     def _read_frame(self, index: int) -> np.ndarray | None:
         if self.cap is None:
             return None
         forward = index - self._cap_pos
-        if 0 <= forward <= self._MAX_FORWARD_GRAB:
+        if 0 <= forward <= self.max_forward_grab:
             # Walk forward from current position: cheaper than re-seeking
             # to a prior keyframe and decoding back up to `index`.
             for _ in range(forward):
@@ -488,7 +544,9 @@ class MainWindow(QMainWindow):
             self.thumb_list.addItem(item)
             self._item_by_index[idx] = item
 
-        self.worker = ThumbnailWorker(self.video_path, THUMB_WIDTH, self)
+        self.worker = ThumbnailWorker(
+            self.video_path, THUMB_WIDTH, self.max_forward_grab, self
+        )
         self.worker.thumb_ready.connect(self._on_thumb_ready)
         self.worker.start()
         self._sync_thumb_selection()

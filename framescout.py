@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -169,12 +170,18 @@ class ThumbnailWorker(QThread):
             cap.release()
 
 
+IMAGE_FORMATS = ("png", "jpg")
+VIDEO_FORMATS = ("mp4",)
+
+
 class ExportWorker(QThread):
     """Writes a fixed list of frames to disk at full resolution.
 
     One-shot: the index list is set at construction and walked in order.
     Uses the same grab-vs-seek heuristic as ThumbnailWorker so big jumps
-    re-seek instead of decoding every intermediate frame.
+    re-seek instead of decoding every intermediate frame. For image formats
+    each frame is written as its own file under `dest`; for video formats
+    all frames go into a single file at `dest`.
     """
 
     frame_done = Signal(int)  # frame index just written
@@ -184,18 +191,21 @@ class ExportWorker(QThread):
         self,
         path: str,
         indices: list[int],
-        dest_dir: str,
-        ext: str,
+        dest: str,
+        fmt: str,
         basename: str,
+        fps: float,
         max_forward_grab: int,
         parent=None,
     ):
         super().__init__(parent)
         self._path = path
         self._indices = sorted(set(indices))
-        self._dest_dir = dest_dir
-        self._ext = ext
+        self._dest = dest
+        self._fmt = fmt
         self._basename = basename
+        # Fallback keeps the writer happy on sources that report 0 fps.
+        self._fps = fps if fps and fps > 0 else 30.0
         self._max_forward_grab = max_forward_grab
         self._stop_lock = threading.Lock()
         self._stop = False
@@ -213,6 +223,8 @@ class ExportWorker(QThread):
         if not cap.isOpened() or not self._indices:
             self.finished_with.emit(0, len(self._indices))
             return
+        is_video = self._fmt in VIDEO_FORMATS
+        writer: cv2.VideoWriter | None = None
         succeeded = 0
         failed = 0
         try:
@@ -236,16 +248,33 @@ class ExportWorker(QThread):
                 if not ok or frame is None:
                     failed += 1
                     continue
-                out_path = str(
-                    Path(self._dest_dir)
-                    / f"{self._basename}_frame_{target:06d}.{self._ext}"
-                )
-                if cv2.imwrite(out_path, frame):
+                if is_video:
+                    if writer is None:
+                        h, w = frame.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(
+                            self._dest, fourcc, self._fps, (w, h)
+                        )
+                        if not writer.isOpened():
+                            writer = None
+                            failed = len(self._indices) - succeeded
+                            break
+                    writer.write(frame)
                     succeeded += 1
                     self.frame_done.emit(target)
                 else:
-                    failed += 1
+                    out_path = str(
+                        Path(self._dest)
+                        / f"{self._basename}_frame_{target:06d}.{self._fmt}"
+                    )
+                    if cv2.imwrite(out_path, frame):
+                        succeeded += 1
+                        self.frame_done.emit(target)
+                    else:
+                        failed += 1
         finally:
+            if writer is not None:
+                writer.release()
             cap.release()
         self.finished_with.emit(succeeded, failed)
 
@@ -726,14 +755,29 @@ class MainWindow(QMainWindow):
         if not indices:
             return
 
-        dest = QFileDialog.getExistingDirectory(self, "Export frames to folder")
-        if not dest:
+        choice = self._ask_export_format()
+        if choice is None:
             return
-        ext = self._ask_export_format()
-        if ext is None:
-            return
+        fmt, export_fps = choice
 
         basename = Path(self.video_path).stem
+        if fmt in VIDEO_FORMATS:
+            default_name = f"{basename}_export.{fmt}"
+            dest, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export frames as video",
+                default_name,
+                f"{fmt.upper()} video (*.{fmt})",
+            )
+            if not dest:
+                return
+            if not dest.lower().endswith(f".{fmt}"):
+                dest += f".{fmt}"
+        else:
+            dest = QFileDialog.getExistingDirectory(self, "Export frames to folder")
+            if not dest:
+                return
+
         # Already-running export shouldn't pile up — let user finish/cancel first.
         if self.export_worker is not None and self.export_worker.isRunning():
             self.statusBar().showMessage("Another export is already in progress", 4000)
@@ -743,8 +787,9 @@ class MainWindow(QMainWindow):
             self.video_path,
             indices,
             dest,
-            ext,
+            fmt,
             basename,
+            export_fps,
             self.max_forward_grab,
             self,
         )
@@ -781,7 +826,7 @@ class MainWindow(QMainWindow):
         progress.canceled.connect(worker.stop)
         worker.start()
 
-    def _ask_export_format(self) -> str | None:
+    def _ask_export_format(self) -> tuple[str, float] | None:
         dlg = QDialog(self)
         dlg.setWindowTitle("Export format")
         dlg.setMinimumWidth(420)
@@ -789,10 +834,24 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(16, 16, 16, 12)
         form.setSpacing(12)
         combo = QComboBox(dlg)
-        combo.addItems(["png", "jpg"])
+        combo.addItems([*IMAGE_FORMATS, *VIDEO_FORMATS])
         combo.setCurrentIndex(0)
         combo.setMinimumWidth(160)
         form.addRow("Format:", combo)
+
+        fps_spin = QDoubleSpinBox(dlg)
+        fps_spin.setDecimals(2)
+        fps_spin.setRange(0.01, 240.0)
+        fps_spin.setSingleStep(1.0)
+        fps_spin.setValue(1.0)
+        fps_spin.setMinimumWidth(160)
+        form.addRow("FPS (video only):", fps_spin)
+
+        def _sync_fps_enabled(_=None) -> None:
+            fps_spin.setEnabled(combo.currentText() in VIDEO_FORMATS)
+        combo.currentIndexChanged.connect(_sync_fps_enabled)
+        _sync_fps_enabled()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=dlg
         )
@@ -801,7 +860,7 @@ class MainWindow(QMainWindow):
         form.addRow(buttons)
         if dlg.exec() != QDialog.Accepted:
             return None
-        return combo.currentText()
+        return combo.currentText(), fps_spin.value()
 
     def _stop_worker(self) -> None:
         if self.worker is not None:
